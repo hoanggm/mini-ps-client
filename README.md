@@ -1,1 +1,1 @@
-# mini-ps-client
+# Mini-PubSub-Client
