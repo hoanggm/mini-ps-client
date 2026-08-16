@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+option java_package = "org.mini.pubsub.proto";
+option java_outer_classname = "PubSubProto";
+
+package pubsub;
+
+enum CommandType {
+  SUBSCRIBE = 0;
+  UNSUBSCRIBE = 1;
+  PUBLISH = 2;
+  ACK = 3;
+}
+
+message MessageRequest {
+  CommandType type = 1;
+  string topic = 2;
+  bytes payload = 3;
+  string message_id = 4;
+}
+
+message MessageResponse {
+  enum Status {
+    SUCCESS = 0;
+    ERROR = 1;
+  }
+  Status status = 1;
+  string topic = 2;
+  bytes payload = 3;
+  string error_message = 4;
+  string message_id = 5;
+}
