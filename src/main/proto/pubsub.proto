@@ -10,6 +10,7 @@ enum CommandType {
   UNSUBSCRIBE = 1;
   PUBLISH = 2;
   ACK = 3;
+  PING = 4;
 }
 
 message MessageRequest {

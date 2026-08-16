@@ -3,15 +3,24 @@ package org.mini.pubsub.client;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import org.mini.pubsub.MessageListener;
+import org.mini.pubsub.PubSubClient;
 import org.mini.pubsub.proto.PubSubProto;
 
 import java.util.Map;
 
 public class ClientHandler extends SimpleChannelInboundHandler<PubSubProto.MessageResponse> {
+    private final PubSubClient client;
     private final Map<String, MessageListener> listeners;
 
-    public ClientHandler(Map<String, MessageListener> listeners) {
+    public ClientHandler(PubSubClient client, Map<String, MessageListener> listeners) {
+        this.client = client;
         this.listeners = listeners;
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        client.scheduleReconnect(0);
+        super.channelInactive(ctx);
     }
 
     @Override
@@ -25,8 +34,6 @@ public class ClientHandler extends SimpleChannelInboundHandler<PubSubProto.Messa
                 try {
                     listener.onMessage(topic, payload);
 
-                    // auto send ack
-                    response.getMessageId();
                     if (!response.getMessageId().isEmpty()) {
                         PubSubProto.MessageRequest ackRequest = PubSubProto.MessageRequest.newBuilder()
                                 .setType(PubSubProto.CommandType.ACK)

@@ -10,8 +10,10 @@ import io.netty.handler.codec.protobuf.ProtobufDecoder;
 import io.netty.handler.codec.protobuf.ProtobufEncoder;
 import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder;
 import io.netty.handler.codec.protobuf.ProtobufVarint32LengthFieldPrepender;
+import io.netty.handler.timeout.IdleStateHandler;
 import org.mini.pubsub.client.ClientConfig;
 import org.mini.pubsub.client.ClientHandler;
+import org.mini.pubsub.client.ClientHeartbeatHandler;
 import org.mini.pubsub.proto.PubSubProto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,15 +21,18 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class PubSubClient {
     private static final Logger log = LoggerFactory.getLogger(PubSubClient.class);
     private final ClientConfig config;
     private final Map<String, MessageListener> listeners = new ConcurrentHashMap<>();
-
     private EventLoopGroup group;
-    private Channel channel;
-    private volatile boolean isConnected = false;
+    private Bootstrap bootstrap;
+    private volatile Channel channel;
+    private final AtomicBoolean isConnected = new AtomicBoolean(false);
+    private final AtomicBoolean isUserClosed = new AtomicBoolean(false);
 
     public PubSubClient(String host, int port) {
         this(new ClientConfig(host, port));
@@ -41,39 +46,81 @@ public class PubSubClient {
      * Khởi tạo kết nối tới Pub-Sub Server.
      */
     public synchronized void connect() throws InterruptedException {
-        if (isConnected) return;
+        if (isConnected.get()) return;
 
-        group = new NioEventLoopGroup();
-        Bootstrap bootstrap = new Bootstrap();
+        if (group == null) {
+            group = new NioEventLoopGroup();
+            bootstrap = new Bootstrap();
+            bootstrap.group(group)
+                    .channel(NioSocketChannel.class)
+                    .option(ChannelOption.TCP_NODELAY, true)
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, config.getConnectTimeoutMs())
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) {
+                            ChannelPipeline pipeline = ch.pipeline();
 
-        bootstrap.group(group)
-                .channel(NioSocketChannel.class)
-                .option(ChannelOption.TCP_NODELAY, true)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, config.getConnectTimeoutMs())
-                .handler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel ch) {
-                        ChannelPipeline p = ch.pipeline();
-                        // Frame & Protobuf Codecs
-                        p.addLast(new ProtobufVarint32FrameDecoder());
-                        p.addLast(new ProtobufDecoder(PubSubProto.MessageResponse.getDefaultInstance()));
-                        p.addLast(new ProtobufVarint32LengthFieldPrepender());
-                        p.addLast(new ProtobufEncoder());
-                        // Handler nội bộ xử lý response
-                        p.addLast(new ClientHandler(listeners));
-                    }
-                });
+                            // 1. Decoders & Encoders
+                            pipeline.addLast(new ProtobufVarint32FrameDecoder());
+                            pipeline.addLast(new ProtobufDecoder(PubSubProto.MessageResponse.getDefaultInstance()));
+                            pipeline.addLast(new ProtobufVarint32LengthFieldPrepender());
+                            pipeline.addLast(new ProtobufEncoder());
+
+                            // 2. IdleStateHandler & Heartbeat
+                            pipeline.addLast(new IdleStateHandler(0, 20, 0, TimeUnit.SECONDS));
+                            pipeline.addLast(new ClientHeartbeatHandler());
+
+                            // 3. ClientHandler
+                            pipeline.addLast(new ClientHandler(PubSubClient.this, listeners));
+                        }
+                    });
+        }
 
         ChannelFuture future = bootstrap.connect(config.getHost(), config.getPort()).sync();
         this.channel = future.channel();
-        this.isConnected = true;
+        this.isConnected.set(true);
+        this.isUserClosed.set(false);
 
         log.info("Successfully connected to Pub-Sub Server at {}:{}", config.getHost(), config.getPort());
     }
 
     /**
-     * Đăng ký nhận tin từ một Topic.
+     * Lập lịch Reconnect với Exponential Backoff khi bị rớt mạng.
      */
+    public void scheduleReconnect(int attempts) {
+        // Cập nhật lại trạng thái ngắt kết nối
+        this.isConnected.set(false);
+
+        // Nếu client chủ động shutdown thì dừng reconnect
+        if (isUserClosed.get()) return;
+
+        long delay = Math.min(1L << attempts, 32);
+        log.warn("Connection lost. Scheduling reconnect attempt #{} in {}s...", attempts + 1, delay);
+
+        group.schedule(() -> {
+            try {
+                connect();
+                // Phục hồi lại toàn bộ Topic đã Subscribe trước đó
+                resubscribeAll();
+                log.info("Reconnected to {}:{} successfully!", config.getHost(), config.getPort());
+            } catch (Exception e) {
+                log.error("Reconnect attempt #{} failed: {}", attempts + 1, e.getMessage());
+                scheduleReconnect(attempts + 1);
+            }
+        }, delay, TimeUnit.SECONDS);
+    }
+
+    private void resubscribeAll() {
+        for (String topic : listeners.keySet()) {
+            PubSubProto.MessageRequest request = PubSubProto.MessageRequest.newBuilder()
+                    .setType(PubSubProto.CommandType.SUBSCRIBE)
+                    .setTopic(topic)
+                    .build();
+            channel.writeAndFlush(request);
+            log.info("Resubscribed to topic [{}]", topic);
+        }
+    }
+
     public void subscribe(String topic, MessageListener listener) {
         checkConnection();
         listeners.put(topic, listener);
@@ -87,9 +134,6 @@ public class PubSubClient {
         log.info("Subscribed to topic [{}]", topic);
     }
 
-    /**
-     * Hủy đăng ký Topic.
-     */
     public void unsubscribe(String topic) {
         checkConnection();
         listeners.remove(topic);
@@ -103,16 +147,10 @@ public class PubSubClient {
         log.info("Unsubscribed from topic [{}]", topic);
     }
 
-    /**
-     * Gửi (Publish) tin nhắn dữ liệu dạng String.
-     */
     public void publish(String topic, String message) {
         this.publish(topic, message.getBytes(StandardCharsets.UTF_8));
     }
 
-    /**
-     * Gửi (Publish) tin nhắn dữ liệu mảng byte.
-     */
     public void publish(String topic, byte[] payload) {
         checkConnection();
 
@@ -125,11 +163,9 @@ public class PubSubClient {
         channel.writeAndFlush(request);
     }
 
-    /**
-     * Ngắt kết nối và giải phóng tài nguyên.
-     */
     public synchronized void close() {
-        if (!isConnected) return;
+        isUserClosed.set(true);
+        isConnected.set(false);
 
         try {
             if (channel != null) {
@@ -141,35 +177,13 @@ public class PubSubClient {
             if (group != null) {
                 group.shutdownGracefully();
             }
-            isConnected = false;
             log.info("Disconnected from Pub-Sub Server");
         }
     }
 
     private void checkConnection() {
-        if (!isConnected || channel == null || !channel.isActive()) {
+        if (!isConnected.get() || channel == null || !channel.isActive()) {
             throw new IllegalStateException("PubSubClient is not connected to server");
-        }
-    }
-
-    /**
-     * Hàm xử lý Reconnect được gọi tự động bởi ClientHandler
-     */
-    public synchronized void reconnect() {
-        if (!isConnected) {
-            log.info("Trying reconnect to {}:{}", config.getHost(), config.getPort());
-            try {
-                this.connect();
-                for (String topic : listeners.keySet()) {
-                    PubSubProto.MessageRequest request = PubSubProto.MessageRequest.newBuilder()
-                            .setType(PubSubProto.CommandType.SUBSCRIBE)
-                            .setTopic(topic)
-                            .build();
-                    channel.writeAndFlush(request);
-                }
-                log.info("Reconnect {}:{} successfully !!!", config.getHost(), config.getPort());
-            } catch (Exception ignored) {
-            }
         }
     }
 }
