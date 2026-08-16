@@ -142,13 +142,13 @@ public class PubSubClient {
                 group.shutdownGracefully();
             }
             isConnected = false;
-            log.info("Disconnected from Pub-Sub Server.");
+            log.info("Disconnected from Pub-Sub Server");
         }
     }
 
     private void checkConnection() {
         if (!isConnected || channel == null || !channel.isActive()) {
-            throw new IllegalStateException("PubSubClient is not connected to server.");
+            throw new IllegalStateException("PubSubClient is not connected to server");
         }
     }
 
