@@ -18,11 +18,14 @@ import org.mini.pubsub.proto.PubSubProto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class PubSubClient {
     private static final Logger log = LoggerFactory.getLogger(PubSubClient.class);
@@ -33,6 +36,9 @@ public class PubSubClient {
     private volatile Channel channel;
     private final AtomicBoolean isConnected = new AtomicBoolean(false);
     private final AtomicBoolean isUserClosed = new AtomicBoolean(false);
+    private final AtomicInteger currentAddressIndex = new AtomicInteger(0);
+    private volatile String connectedHost;
+    private volatile Integer connectedPort;
 
     public PubSubClient(String host, int port) {
         this(new ClientConfig(host, port));
@@ -76,12 +82,60 @@ public class PubSubClient {
                     });
         }
 
-        ChannelFuture future = bootstrap.connect(config.getHost(), config.getPort()).sync();
-        this.channel = future.channel();
-        this.isConnected.set(true);
-        this.isUserClosed.set(false);
+        if (config.getIsClusterMode()) {
+            List<InetSocketAddress> addresses = config.getServerAddresses();
+            int maxAttempts = (addresses != null && !addresses.isEmpty()) ? addresses.size() : 1;
 
-        log.info("Successfully connected to Pub-Sub Server at {}:{}", config.getHost(), config.getPort());
+            for (int i = 0; i < maxAttempts; i++) {
+                InetSocketAddress targetAddress = getNextAddress();
+                log.info("Connecting to Pub-Sub Server at {}:{}", targetAddress.getHostString(),
+                        targetAddress.getPort());
+
+                try {
+                    ChannelFuture future = bootstrap.connect(targetAddress.getHostString(), targetAddress.getPort()).sync();
+                    this.channel = future.channel();
+                    this.isConnected.set(true);
+                    this.isUserClosed.set(false);
+                    this.connectedHost = targetAddress.getHostString();
+                    this.connectedPort = targetAddress.getPort();
+
+                    log.info("Successfully connected to Pub-Sub Server at {}:{}", targetAddress.getHostString(),
+                            targetAddress.getPort());
+                    return;
+                } catch (Exception e) {
+                    log.warn("Failed to connect to node {}:{}. Trying next node in cluster...",
+                            targetAddress.getHostString(), targetAddress.getPort());
+                }
+            }
+
+            if (config.isAutoReconnect()) {
+                log.warn("Could not connect to any cluster node on startup. Scheduling background reconnect...");
+                scheduleReconnect(0);
+            } else {
+                log.warn("Could not connect to any cluster node on startup");
+            }
+        } else {
+            ChannelFuture future = bootstrap.connect(config.getHost(), config.getPort()).sync();
+            this.channel = future.channel();
+            this.isConnected.set(true);
+            this.isUserClosed.set(false);
+            this.connectedHost = config.getHost();
+            this.connectedPort = config.getPort();
+
+            log.info("Successfully connected to Pub-Sub Server at {}:{}", config.getHost(), config.getPort());
+        }
+    }
+
+    /**
+     * Lấy địa chỉ tiếp theo trong cụm
+     */
+    private InetSocketAddress getNextAddress() {
+        List<InetSocketAddress> addresses = config.getServerAddresses();
+        if (addresses == null || addresses.isEmpty()) {
+            throw new IllegalStateException("No server addresses configured.");
+        }
+        int index = (currentAddressIndex.getAndIncrement() & 0x7FFFFFFF) % addresses.size();
+        return addresses.get(index);
     }
 
     /**
@@ -92,7 +146,7 @@ public class PubSubClient {
         this.isConnected.set(false);
 
         // Nếu client chủ động shutdown thì dừng reconnect
-        if (isUserClosed.get()) return;
+        if (!config.isAutoReconnect() || isUserClosed.get()) return;
 
         long delay = Math.min(1L << attempts, 32);
         log.warn("Connection lost. Scheduling reconnect attempt #{} in {}s...", attempts + 1, delay);
@@ -100,9 +154,8 @@ public class PubSubClient {
         group.schedule(() -> {
             try {
                 connect();
-                // Phục hồi lại toàn bộ Topic đã Subscribe trước đó
                 resubscribeAll();
-                log.info("Reconnected to {}:{} successfully!", config.getHost(), config.getPort());
+                log.info("Reconnected to {}:{} successfully!", connectedHost, connectedPort);
             } catch (Exception e) {
                 log.error("Reconnect attempt #{} failed: {}", attempts + 1, e.getMessage());
                 scheduleReconnect(attempts + 1);
