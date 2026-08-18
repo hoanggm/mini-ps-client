@@ -7,6 +7,7 @@ import org.mini.pubsub.PubSubClient;
 import org.mini.pubsub.proto.PubSubProto;
 
 import java.util.Map;
+import java.util.Objects;
 
 public class ClientHandler extends SimpleChannelInboundHandler<PubSubProto.MessageResponse> {
     private final PubSubClient client;
@@ -34,7 +35,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<PubSubProto.Messa
                 try {
                     listener.onMessage(topic, payload);
 
-                    if (!response.getMessageId().isEmpty()) {
+                    if (response.getMessageId() != 0L) {
                         PubSubProto.MessageRequest ackRequest = PubSubProto.MessageRequest.newBuilder()
                                 .setType(PubSubProto.CommandType.ACK)
                                 .setMessageId(response.getMessageId())
